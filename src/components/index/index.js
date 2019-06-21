@@ -1,5 +1,12 @@
 const _ = require('lodash')
-const Database = require('better-sqlite3')
+
+// better-sqlite3 may not be present - fallback to in memory processing
+try {
+  var Database = require('better-sqlite3')
+} catch (err) {
+  var Database = null
+}
+
 const delta = require('./delta')
 const EventEmitter = require('events')
 const exiftool = require('../exiftool/parallel')
@@ -7,6 +14,7 @@ const fs = require('fs-extra')
 const globber = require('./glob')
 const moment = require('moment')
 const path = require('path')
+const warn = require('debug')('thumbsup:warn')
 
 const EXIF_DATE_FORMAT = 'YYYY:MM:DD HH:mm:ssZ'
 
@@ -14,8 +22,14 @@ class Index {
   constructor (indexPath) {
     // create the database if it doesn't exist
     fs.mkdirpSync(path.dirname(indexPath))
-    this.db = new Database(indexPath, {})
-    this.db.exec('CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, timestamp INTEGER, metadata BLOB)')
+
+    if (Database) {
+      this.db = new Database(indexPath, {})
+      this.db.exec('CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, timestamp INTEGER, metadata BLOB)')
+    } else {
+      this.localDB = [];
+      warn("better-sqlite3 is not available - storing in memory instead")
+    }
   }
 
   /*
@@ -24,31 +38,52 @@ class Index {
   update (mediaFolder, options = {}) {
     // will emit many different events
     const emitter = new EventEmitter()
+    var index = this;
 
     // prepared database statements
-    const selectStatement = this.db.prepare('SELECT path, timestamp FROM files')
-    const insertStatement = this.db.prepare('INSERT OR REPLACE INTO files VALUES (?, ?, ?)')
-    const deleteStatement = this.db.prepare('DELETE FROM files WHERE path = ?')
-    const countStatement = this.db.prepare('SELECT COUNT(*) AS count FROM files')
-    const selectMetadata = this.db.prepare('SELECT * FROM files')
+    if (this.db) {
+      var selectStatement = this.db.prepare('SELECT path, timestamp FROM files')
+      var insertStatement = this.db.prepare('INSERT OR REPLACE INTO files VALUES (?, ?, ?)')
+      var deleteStatement = this.db.prepare('DELETE FROM files WHERE path = ?')
+      var countStatement = this.db.prepare('SELECT COUNT(*) AS count FROM files')
+      var selectMetadata = this.db.prepare('SELECT * FROM files')
+    }
 
     // create hashmap of all files in the database
     const databaseMap = {}
-    for (var row of selectStatement.iterate()) {
-      databaseMap[row.path] = row.timestamp
+    if (selectStatement) {
+      for (var row of selectStatement.iterate()) {
+        databaseMap[row.path] = row.timestamp
+      }
     }
 
     function finished () {
+      var result
+
       // emit every file in the index
-      for (var row of selectMetadata.iterate()) {
+      function emitRow(row) {
         emitter.emit('file', {
           path: row.path,
           timestamp: new Date(row.timestamp),
           metadata: JSON.parse(row.metadata)
         })
       }
+
+      if (selectMetadata) {
+        for (var row of selectMetadata.iterate()) {
+          emitRow(row)
+        }
+      } else {
+        index.localDB.forEach(emitRow);
+      }
+      
       // emit the final count
-      const result = countStatement.get()
+      if (countStatement) {
+        result = countStatement.get()
+      } else {
+        result = index.localDB.length
+      }
+
       emitter.emit('done', { count: result.count })
     }
 
@@ -67,9 +102,11 @@ class Index {
       })
 
       // remove deleted files from the DB
-      _.each(deltaFiles.deleted, path => {
-        deleteStatement.run(path)
-      })
+      if (deleteStatement) {
+        _.each(deltaFiles.deleted, path => {
+          deleteStatement.run(path)
+        })
+      }
 
       // check if any files need parsing
       var processed = 0
@@ -83,7 +120,16 @@ class Index {
       const stream = exiftool.parse(mediaFolder, toProcess, options.concurrency)
       stream.on('data', entry => {
         const timestamp = moment(entry.File.FileModifyDate, EXIF_DATE_FORMAT).valueOf()
-        insertStatement.run(entry.SourceFile, timestamp, JSON.stringify(entry))
+
+        if (insertStatement) {
+          insertStatement.run(entry.SourceFile, timestamp, JSON.stringify(entry))
+        } else {
+          this.localDB.push({
+            key: entry.SourceFile, 
+            timestamp: timestamp, 
+            metadata: JSON.stringify(entry)
+          })
+        }
         ++processed
         emitter.emit('progress', { path: entry.SourceFile, processed: processed, total: toProcess.length })
       }).on('end', finished)
@@ -97,7 +143,9 @@ class Index {
     which can be needed if files are often deleted/modified
   */
   vacuum () {
-    this.db.exec('VACUUM')
+    if (this.db) {
+      this.db.exec('VACUUM')
+    }
   }
 }
 
