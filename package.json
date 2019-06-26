@@ -63,7 +63,8 @@
     "zen-observable": "^0.8.14"
   },
   "optionalDependencies": {
-    "better-sqlite3": "^5.4.0"
+    "better-sqlite3": "^5.4.0",
+    "sqlite3": "^4.0.8"
   },
   "devDependencies": {
     "glob": "^7.1.4",
